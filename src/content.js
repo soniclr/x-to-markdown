@@ -403,15 +403,13 @@
         urls.push({ type: "image", url: cleanImageUrl(src) });
       }
     }
-    const videos = article.querySelectorAll("video[src], video source[src]");
-    for (const vid of videos) {
-      const src = vid.getAttribute("src") || "";
-      if (src) urls.push({ type: "video", url: src });
-    }
-    const videoPoster = article.querySelector("video[poster]");
-    if (videoPoster) {
-      const poster = videoPoster.getAttribute("poster");
-      if (poster) urls.push({ type: "video_thumbnail", url: poster });
+    // Video: only poster (thumbnail) is downloadable; blob: src cannot be fetched
+    const videoEls = article.querySelectorAll("video[poster]");
+    for (const vid of videoEls) {
+      const poster = vid.getAttribute("poster");
+      if (poster) {
+        urls.push({ type: "video_thumbnail", url: poster });
+      }
     }
     return urls;
   }
