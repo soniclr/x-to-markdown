@@ -311,6 +311,9 @@
     // Check if we have API-sourced article/note data for this tweet
     const cachedArticle = tweetId ? articleDataCache[tweetId] : null;
 
+    // Always extract DOM images — these are reliable, working URLs
+    const domMediaUrls = extractMediaUrls(article, tweetId);
+
     const data = {
       url,
       tweetId,
@@ -320,32 +323,45 @@
       publishedAt: extractPublishedTime(article),
       capturedAt: new Date().toISOString(),
       metrics: extractMetrics(article),
-      mediaUrls: extractMediaUrls(article, tweetId),
+      mediaUrls: domMediaUrls,
       quotedTweet: extractQuotedTweet(article),
     };
 
     if (cachedArticle?.type === "note") {
-      const noteBlocks = buildNoteBlocks(cachedArticle.data);
+      // For Notes: use API text + DOM images
+      // API gives us text + inline_media positions, DOM gives us actual image URLs
+      const domImages = domMediaUrls
+        .filter((m) => m.type === "image")
+        .map((m) => m.url);
+      const noteBlocks = buildNoteBlocks(cachedArticle.data, domImages);
       if (noteBlocks.length > 0) {
         data.isArticle = true;
-        data.articleTitle = noteBlocks[0]?.content?.split("\n")[0]?.slice(0, 100) || "";
+        data.articleTitle = noteBlocks.find((b) => b.type === "text")?.content?.split("\n")[0]?.slice(0, 100) || "";
         data.contentBlocks = noteBlocks;
-        // Collect image URLs from note inline media for downloading
-        data.mediaUrls = noteBlocks
+        // Collect ALL image URLs from content blocks for downloading
+        const blockImages = noteBlocks
           .filter((b) => b.type === "image")
           .map((b) => ({ type: "image", url: b.url }));
+        // Merge: block images + any video/video_thumbnail from DOM
+        const nonImageMedia = domMediaUrls.filter((m) => m.type !== "image");
+        data.mediaUrls = [...blockImages, ...nonImageMedia];
       }
     } else if (cachedArticle?.type === "article") {
-      const articleBlocks = buildArticleBlocks(cachedArticle.data);
+      const domImages = domMediaUrls
+        .filter((m) => m.type === "image")
+        .map((m) => m.url);
+      const articleBlocks = buildArticleBlocks(cachedArticle.data, domImages);
       if (articleBlocks.length > 0) {
         data.isArticle = true;
         data.articleTitle = cachedArticle.data.title || "";
         data.contentBlocks = articleBlocks;
         data.text = "";
-        // Collect image URLs from article blocks for downloading
-        data.mediaUrls = articleBlocks
+        // Collect image URLs from content blocks for downloading
+        const blockImages = articleBlocks
           .filter((b) => b.type === "image")
           .map((b) => ({ type: "image", url: b.url }));
+        const nonImageMedia = domMediaUrls.filter((m) => m.type !== "image");
+        data.mediaUrls = [...blockImages, ...nonImageMedia];
       }
     }
 
@@ -354,29 +370,30 @@
 
   // ── Note (long-form tweet) content block building ──
 
-  function buildNoteBlocks(noteData) {
+  function buildNoteBlocks(noteData, domImages) {
     const blocks = [];
     const text = noteData.text || "";
     if (!text) return blocks;
 
     const inlineMedia = noteData.inlineMedia || [];
     const mediaEntities = noteData.mediaEntities || [];
+    // domImages: array of image URLs extracted from the DOM (reliable, downloadable)
 
-    // Build a map of media_id -> best image URL
-    const mediaUrlMap = {};
-    for (const entity of mediaEntities) {
-      if (entity.media_key || entity.id_str) {
-        const key = entity.media_key || entity.id_str;
-        const url = entity.media_url_https || entity.media_url || "";
-        if (url) {
-          mediaUrlMap[key] = cleanImageUrl(url);
-        }
-      }
-    }
+    // Try to build image URL list from API media entities first
+    const apiImageUrls = mediaEntities
+      .filter((e) => (e.type === "photo" || !e.type) && (e.media_url_https || e.media_url))
+      .map((e) => cleanImageUrl(e.media_url_https || e.media_url));
 
-    if (inlineMedia.length === 0) {
-      // No inline media — just return the full text as a single block
+    // Use DOM images as primary source — they always work
+    // Fall back to API images only if DOM has none
+    const imageUrls = (domImages && domImages.length > 0) ? domImages : apiImageUrls;
+
+    if (inlineMedia.length === 0 || imageUrls.length === 0) {
+      // No inline media positions or no images — put all text first, then images at the end
       blocks.push({ type: "text", content: text });
+      for (const url of imageUrls) {
+        blocks.push({ type: "image", url });
+      }
       return blocks;
     }
 
@@ -384,7 +401,9 @@
     const sortedMedia = [...inlineMedia].sort((a, b) => a.index - b.index);
 
     // Split text at inline media insertion points
+    // Use positional matching: 1st inline_media → 1st image URL, etc.
     let lastIndex = 0;
+    let mediaSeqIdx = 0;
     for (const media of sortedMedia) {
       const insertAt = media.index;
       if (insertAt > lastIndex) {
@@ -393,11 +412,11 @@
           blocks.push({ type: "text", content: textChunk });
         }
       }
-      // Find the image URL for this media
-      const mediaUrl = mediaUrlMap[media.media_id] || "";
+      const mediaUrl = imageUrls[mediaSeqIdx] || "";
       if (mediaUrl) {
         blocks.push({ type: "image", url: mediaUrl });
       }
+      mediaSeqIdx++;
       lastIndex = insertAt;
     }
 
@@ -409,12 +428,17 @@
       }
     }
 
+    // Any remaining images that weren't matched to inline positions
+    for (let i = mediaSeqIdx; i < imageUrls.length; i++) {
+      blocks.push({ type: "image", url: imageUrls[i] });
+    }
+
     return blocks;
   }
 
   // ── Article (X Articles with Draft.js content_state) content block building ──
 
-  function buildArticleBlocks(articleData) {
+  function buildArticleBlocks(articleData, domImages) {
     const blocks = [];
     const contentState = articleData.contentState;
 
@@ -423,6 +447,12 @@
       const plainText = articleData.previewText || "";
       if (plainText) {
         blocks.push({ type: "text", content: plainText });
+      }
+      // Append DOM images if available
+      if (domImages) {
+        for (const url of domImages) {
+          blocks.push({ type: "image", url });
+        }
       }
       return blocks;
     }
@@ -440,11 +470,18 @@
       }
     }
 
-    for (const block of contentState.blocks) {
+    // Track how many atomic/image blocks we find from API
+    let apiImageCount = 0;
+    // Track atomic block positions for DOM image insertion
+    const atomicPositions = [];
+
+    for (let i = 0; i < contentState.blocks.length; i++) {
+      const block = contentState.blocks[i];
       const blockType = block.type || "unstyled";
 
       if (blockType === "atomic") {
         // Atomic blocks contain media/embeds via entity ranges
+        let foundImage = false;
         for (const range of (block.entityRanges || [])) {
           const entity = entityMap[String(range.key)];
           if (!entity) continue;
@@ -460,10 +497,14 @@
                   item.media_url_https || mediaUrlMap[item.media_id] || "";
                 if (url) {
                   blocks.push({ type: "image", url: cleanImageUrl(url) });
+                  apiImageCount++;
+                  foundImage = true;
                 }
               }
             } else if (eData.url) {
               blocks.push({ type: "image", url: cleanImageUrl(eData.url) });
+              apiImageCount++;
+              foundImage = true;
             }
           } else if (eType === "TWEET") {
             const tweetUrl = eData.tweetId
@@ -478,6 +519,10 @@
               blocks.push({ type: "text", content: `[${linkUrl}](${linkUrl})` });
             }
           }
+        }
+        // Record position for DOM image fallback
+        if (!foundImage) {
+          atomicPositions.push(blocks.length);
         }
         continue;
       }
@@ -513,6 +558,21 @@
       }
 
       blocks.push({ type: "text", content });
+    }
+
+    // If API didn't resolve any images but we have DOM images, use DOM as fallback
+    if (apiImageCount === 0 && domImages && domImages.length > 0) {
+      if (atomicPositions.length > 0 && atomicPositions.length === domImages.length) {
+        // Insert DOM images at atomic block positions (reverse to preserve indices)
+        for (let i = atomicPositions.length - 1; i >= 0; i--) {
+          blocks.splice(atomicPositions[i], 0, { type: "image", url: domImages[i] });
+        }
+      } else {
+        // No position info or count mismatch — append images at end
+        for (const url of domImages) {
+          blocks.push({ type: "image", url });
+        }
+      }
     }
 
     return blocks;
@@ -608,14 +668,38 @@
 
   function extractMediaUrls(article, tweetId) {
     const urls = [];
-    const images = article.querySelectorAll('[data-testid="tweetPhoto"] img[src]');
-    for (const img of images) {
+    const seen = new Set();
+
+    // 1. Standard tweet photos (wrapped in tweetPhoto container)
+    const tweetPhotos = article.querySelectorAll('[data-testid="tweetPhoto"] img[src]');
+    for (const img of tweetPhotos) {
       const src = img.getAttribute("src") || "";
       if (src && !src.includes("emoji") && !src.includes("profile_images")) {
-        urls.push({ type: "image", url: cleanImageUrl(src) });
+        const clean = cleanImageUrl(src);
+        if (!seen.has(clean)) {
+          seen.add(clean);
+          urls.push({ type: "image", url: clean });
+        }
       }
     }
-    // Video: use intercepted mp4 URL if available, otherwise save poster
+
+    // 2. Inline images in Note/long-form content (pbs.twimg.com images not in tweetPhoto)
+    //    These appear directly in the article as <img> with pbs.twimg.com/media/ src
+    const allImages = article.querySelectorAll('img[src*="pbs.twimg.com/media/"]');
+    for (const img of allImages) {
+      // Skip if inside quoted tweet
+      if (img.closest('[data-testid="quoteTweet"]')) continue;
+      const src = img.getAttribute("src") || "";
+      if (src) {
+        const clean = cleanImageUrl(src);
+        if (!seen.has(clean)) {
+          seen.add(clean);
+          urls.push({ type: "image", url: clean });
+        }
+      }
+    }
+
+    // 3. Video: use intercepted mp4 URL if available, otherwise save poster
     const videoUrl = tweetId ? videoUrlCache[tweetId] : null;
     if (videoUrl) {
       urls.push({ type: "video", url: videoUrl });

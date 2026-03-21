@@ -90,11 +90,24 @@
       // Extract Note (long-form tweet) content
       const noteResult = obj.note_tweet?.note_tweet_results?.result;
       if (noteResult) {
+        // Build enriched media entities with all possible ID formats
+        const enrichedMedia = mediaEntities.map((entity) => {
+          const ids = [];
+          if (entity.id_str) ids.push(entity.id_str);
+          if (entity.id) ids.push(String(entity.id));
+          if (entity.media_key) ids.push(entity.media_key);
+          // media_key is often "3_{id_str}" — register the numeric part too
+          if (entity.media_key && entity.media_key.includes("_")) {
+            ids.push(entity.media_key.split("_").pop());
+          }
+          return { ...entity, _allIds: ids };
+        });
+
         const noteData = {
           text: noteResult.text || "",
           richTextTags: noteResult.richtext?.richtext_tags || [],
           inlineMedia: noteResult.media?.inline_media || [],
-          mediaEntities: mediaEntities,
+          mediaEntities: enrichedMedia,
         };
         articleMap[tweetId] = { type: "note", data: noteData };
         window.postMessage({
