@@ -251,6 +251,21 @@
   }
 
   function findVisibleTweet() {
+    // On detail pages (/status/), prefer the main tweet over replies
+    const pathMatch = window.location.pathname.match(/\/([^/]+)\/status\/(\d+)/);
+    if (pathMatch) {
+      const statusId = pathMatch[2];
+      const articles = document.querySelectorAll('article[data-testid="tweet"]');
+      for (const article of articles) {
+        const link = findStatusLink(article);
+        const href = link?.getAttribute("href") || "";
+        if (href.includes(`/status/${statusId}`)) {
+          return article;
+        }
+      }
+    }
+
+    // Fallback: find the tweet closest to viewport center
     const articles = document.querySelectorAll('article[data-testid="tweet"]');
     const viewportCenter = window.innerHeight / 2;
     let best = null;
@@ -301,12 +316,22 @@
   // ── Tweet data extraction ──
 
   function extractTweetData(article) {
-    const statusLink = findStatusLink(article);
-    const url = normalizeUrl(
-      statusLink?.href || statusLink?.getAttribute("href") || ""
-    );
-    const tweetIdMatch = url.match(/status\/(\d+)/);
-    const tweetId = tweetIdMatch ? tweetIdMatch[1] : "";
+    // On detail pages, use URL for tweetId (more reliable than DOM link)
+    const pathMatch = window.location.pathname.match(/\/([^/]+)\/status\/(\d+)/);
+    let url = "";
+    let tweetId = "";
+
+    if (pathMatch) {
+      // Detail page — use URL directly
+      url = `https://x.com/${pathMatch[1]}/status/${pathMatch[2]}`;
+      tweetId = pathMatch[2];
+    } else {
+      // Timeline/feed — use link inside article
+      const statusLink = findStatusLink(article);
+      url = normalizeUrl(statusLink?.href || statusLink?.getAttribute("href") || "");
+      const match = url.match(/status\/(\d+)/);
+      tweetId = match ? match[1] : "";
+    }
 
     // Check if we have API-sourced article/note data for this tweet
     const cachedArticle = tweetId ? articleDataCache[tweetId] : null;
@@ -317,7 +342,7 @@
     const data = {
       url,
       tweetId,
-      authorHandle: extractHandle(article),
+      authorHandle: pathMatch ? pathMatch[1] : extractHandle(article),
       authorName: extractAuthorName(article),
       text: extractText(article),
       publishedAt: extractPublishedTime(article),
@@ -326,6 +351,66 @@
       mediaUrls: domMediaUrls,
       quotedTweet: extractQuotedTweet(article),
     };
+
+    // If no API cache and text is empty, try broader DOM extraction
+    // Long-form notes may render content outside the article element
+    if (!cachedArticle && !data.text) {
+      // Search the entire primary column, not just the article
+      const primaryCol = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+
+      // Collect all tweetText and pbs.twimg images in DOM order
+      const selector = '[data-testid="tweetText"], img[src*="pbs.twimg.com/media/"]';
+      const nodes = primaryCol.querySelectorAll(selector);
+      const contentBlocks = [];
+      const seenText = new Set();
+      const seenImg = new Set();
+
+      for (const node of nodes) {
+        // Skip content inside reply tweets (articles after the main one)
+        // but include content that's NOT in any article (long-form body)
+        if (node.closest('[data-testid="quoteTweet"]')) continue;
+
+        // For nodes inside an article, only include if it's the main article
+        const parentArticle = node.closest('article[data-testid="tweet"]');
+        if (parentArticle && parentArticle !== article) {
+          // Check if this article comes AFTER the main tweet (i.e. it's a reply)
+          // by comparing document position
+          if (article.compareDocumentPosition(parentArticle) & Node.DOCUMENT_POSITION_FOLLOWING) {
+            continue; // Skip replies
+          }
+        }
+
+        if (node.matches('[data-testid="tweetText"]')) {
+          const t = node.innerText?.trim();
+          if (t && !seenText.has(t)) {
+            seenText.add(t);
+            contentBlocks.push({ type: "text", content: t });
+          }
+        } else if (node.tagName === "IMG") {
+          const src = node.getAttribute("src") || "";
+          if (src && !src.includes("emoji") && !src.includes("profile_images")) {
+            const clean = cleanImageUrl(src);
+            if (!seenImg.has(clean)) {
+              seenImg.add(clean);
+              contentBlocks.push({ type: "image", url: clean });
+            }
+          }
+        }
+      }
+
+      if (contentBlocks.length > 0) {
+        const textParts = contentBlocks.filter((b) => b.type === "text");
+        data.text = textParts.map((b) => b.content).join("\n\n");
+        data.isArticle = true;
+        data.articleTitle = data.text.split("\n")[0]?.slice(0, 100) || "";
+        data.contentBlocks = contentBlocks;
+        const blockImages = contentBlocks
+          .filter((b) => b.type === "image")
+          .map((b) => ({ type: "image", url: b.url }));
+        const nonImageMedia = domMediaUrls.filter((m) => m.type !== "image");
+        data.mediaUrls = [...blockImages, ...nonImageMedia];
+      }
+    }
 
     if (cachedArticle?.type === "note") {
       // For Notes: use API text + DOM images
