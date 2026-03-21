@@ -30,7 +30,7 @@
     }
 
     if (message?.type === "WRITE_TO_FOLDER") {
-      writeFileToFolder(message.markdown, message.filename)
+      writeFileToFolder(message.markdown, message.filename, message.mediaDownloads)
         .then((result) => sendResponse(result))
         .catch((err) =>
           sendResponse({ success: false, error: err.message })
@@ -478,7 +478,7 @@
     }
   }
 
-  async function writeFileToFolder(markdown, filename) {
+  async function writeFileToFolder(markdown, filename, mediaDownloads) {
     let dirHandle = cachedDirHandle || await getStoredHandle();
 
     if (!dirHandle) {
@@ -486,7 +486,6 @@
         dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
         await storeHandle(dirHandle);
         cachedDirHandle = dirHandle;
-        // Sync folder name to chrome.storage so popup can display it
         chrome.storage.local.set({ folderName: dirHandle.name });
       } catch (err) {
         if (err.name === "AbortError") {
@@ -505,10 +504,24 @@
     }
 
     try {
+      // Write markdown file
       const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
       const writable = await fileHandle.createWritable();
       await writable.write(markdown);
       await writable.close();
+
+      // Download media files
+      if (mediaDownloads?.length > 0) {
+        const results = await downloadMediaFiles(dirHandle, mediaDownloads);
+        const failed = results.filter((r) => !r.success);
+        if (failed.length > 0) {
+          return {
+            success: true,
+            message: `已保存到 ${dirHandle.name}/${filename}（${failed.length} 个媒体下载失败）`,
+          };
+        }
+      }
+
       return {
         success: true,
         message: `已保存到 ${dirHandle.name}/${filename}`,
@@ -516,6 +529,43 @@
     } catch (err) {
       return { success: false, error: "写入文件失败: " + err.message };
     }
+  }
+
+  async function getOrCreateDir(parentHandle, pathSegments) {
+    let current = parentHandle;
+    for (const segment of pathSegments) {
+      current = await current.getDirectoryHandle(segment, { create: true });
+    }
+    return current;
+  }
+
+  async function downloadMediaFiles(dirHandle, mediaDownloads) {
+    const results = [];
+
+    for (const media of mediaDownloads) {
+      try {
+        const response = await fetch(media.url, { mode: "cors" });
+        if (!response.ok) {
+          results.push({ success: false, url: media.url, error: response.statusText });
+          continue;
+        }
+        const blob = await response.blob();
+
+        const dirSegments = media.dir.split("/");
+        const subDir = await getOrCreateDir(dirHandle, dirSegments);
+
+        const fileHandle = await subDir.getFileHandle(media.localName, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+
+        results.push({ success: true, url: media.url });
+      } catch (err) {
+        results.push({ success: false, url: media.url, error: err.message });
+      }
+    }
+
+    return results;
   }
 
   function openDB() {

@@ -23,8 +23,57 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleSaveTweet(payload, sender) {
   const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-  const markdown = buildMarkdown(payload, settings);
-  const filename = buildFilename(payload) + ".md";
+  const slug = buildFilename(payload);
+  const filename = slug + ".md";
+
+  // Build media download list with local paths
+  const mediaDownloads = [];
+  if (settings.includeMedia && payload.mediaUrls?.length > 0) {
+    const seen = new Set();
+    let imgIndex = 0;
+    let vidIndex = 0;
+    for (const media of payload.mediaUrls) {
+      if (seen.has(media.url)) continue;
+      seen.add(media.url);
+
+      if (media.type === "image" || media.type === "video_thumbnail") {
+        imgIndex++;
+        const ext = guessImageExt(media.url);
+        const localName = `${imgIndex}${ext}`;
+        const localPath = `assets/img/${slug}/${localName}`;
+        mediaDownloads.push({
+          url: media.url,
+          type: media.type,
+          localPath,
+          dir: `assets/img/${slug}`,
+          localName,
+        });
+      } else if (media.type === "video") {
+        vidIndex++;
+        const ext = guessVideoExt(media.url);
+        const localName = `${vidIndex}${ext}`;
+        const localPath = `assets/videos/${slug}/${localName}`;
+        mediaDownloads.push({
+          url: media.url,
+          type: media.type,
+          localPath,
+          dir: `assets/videos/${slug}`,
+          localName,
+        });
+      }
+    }
+  }
+
+  // Build markdown with local paths
+  const localMediaUrls = mediaDownloads.map((d) => ({
+    type: d.type,
+    url: d.localPath,
+  }));
+  const markdownPayload = {
+    ...payload,
+    mediaUrls: localMediaUrls.length > 0 ? localMediaUrls : payload.mediaUrls,
+  };
+  const markdown = buildMarkdown(markdownPayload, settings, localMediaUrls.length > 0);
 
   const tabId = sender?.tab?.id;
   if (!tabId) {
@@ -37,6 +86,7 @@ async function handleSaveTweet(payload, sender) {
       type: "WRITE_TO_FOLDER",
       markdown,
       filename,
+      mediaDownloads,
     });
   } catch (err) {
     return { success: false, error: "写入失败: " + err.message };
@@ -58,9 +108,28 @@ async function handleSaveTweet(payload, sender) {
   return result;
 }
 
+function guessImageExt(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    if (pathname.includes(".png")) return ".png";
+    if (pathname.includes(".gif")) return ".gif";
+    if (pathname.includes(".webp")) return ".webp";
+  } catch (_e) { /* ignore */ }
+  return ".jpg";
+}
+
+function guessVideoExt(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    if (pathname.includes(".webm")) return ".webm";
+    if (pathname.includes(".m3u8")) return ".m3u8";
+  } catch (_e) { /* ignore */ }
+  return ".mp4";
+}
+
 // ── Markdown building ──
 
-function buildMarkdown(payload, settings) {
+function buildMarkdown(payload, settings, hasLocalMedia) {
   const sections = [];
 
   if (settings.includeFrontmatter) {
@@ -72,7 +141,7 @@ function buildMarkdown(payload, settings) {
   sections.push(buildBody(payload));
 
   if (settings.includeMedia && payload.mediaUrls?.length > 0) {
-    sections.push(buildMediaSection(payload.mediaUrls));
+    sections.push(buildMediaSection(payload.mediaUrls, hasLocalMedia));
   }
 
   if (payload.quotedTweet) {
@@ -143,7 +212,7 @@ function buildBody(payload) {
   return `## Content\n\n${text}`;
 }
 
-function buildMediaSection(mediaUrls) {
+function buildMediaSection(mediaUrls, hasLocalMedia) {
   const lines = ["## Media", ""];
   const seen = new Set();
 
@@ -156,7 +225,11 @@ function buildMediaSection(mediaUrls) {
     if (media.type === "image") {
       lines.push(`![image](${media.url})`);
     } else if (media.type === "video") {
-      lines.push(`[Video](${media.url})`);
+      if (hasLocalMedia) {
+        lines.push(`![video](${media.url})`);
+      } else {
+        lines.push(`[Video](${media.url})`);
+      }
     } else if (media.type === "video_thumbnail") {
       lines.push(`![video thumbnail](${media.url})`);
     }
