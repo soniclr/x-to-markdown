@@ -562,13 +562,19 @@
 
     // If API didn't resolve any images but we have DOM images, use DOM as fallback
     if (apiImageCount === 0 && domImages && domImages.length > 0) {
-      if (atomicPositions.length > 0 && atomicPositions.length === domImages.length) {
+      if (atomicPositions.length > 0) {
         // Insert DOM images at atomic block positions (reverse to preserve indices)
-        for (let i = atomicPositions.length - 1; i >= 0; i--) {
+        // Match as many as possible; extra images go at the end
+        const insertCount = Math.min(atomicPositions.length, domImages.length);
+        for (let i = insertCount - 1; i >= 0; i--) {
           blocks.splice(atomicPositions[i], 0, { type: "image", url: domImages[i] });
         }
+        // Append remaining images that don't have atomic positions
+        for (let i = insertCount; i < domImages.length; i++) {
+          blocks.push({ type: "image", url: domImages[i] });
+        }
       } else {
-        // No position info or count mismatch — append images at end
+        // No atomic blocks at all — append images at end
         for (const url of domImages) {
           blocks.push({ type: "image", url });
         }
