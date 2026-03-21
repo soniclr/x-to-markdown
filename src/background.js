@@ -19,6 +19,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       );
     return true;
   }
+
+  if (message?.type === "BUILD_MARKDOWN") {
+    const markdown = buildMarkdown(
+      message.payload,
+      message.settings,
+      message.mediaUrlMap || {}
+    );
+    sendResponse({ markdown });
+    return false;
+  }
 });
 
 async function handleSaveTweet(payload, sender) {
@@ -26,7 +36,7 @@ async function handleSaveTweet(payload, sender) {
   const slug = buildFilename(payload);
   const filename = slug + ".md";
 
-  // Build media download list with local paths
+  // Build media download plan
   const mediaDownloads = [];
   if (settings.includeMedia && payload.mediaUrls?.length > 0) {
     const seen = new Set();
@@ -40,11 +50,10 @@ async function handleSaveTweet(payload, sender) {
         imgIndex++;
         const ext = guessImageExt(media.url);
         const localName = `${imgIndex}${ext}`;
-        const localPath = `assets/img/${slug}/${localName}`;
         mediaDownloads.push({
-          url: media.url,
+          remoteUrl: media.url,
           type: media.type,
-          localPath,
+          localPath: `assets/img/${slug}/${localName}`,
           dir: `assets/img/${slug}`,
           localName,
         });
@@ -52,11 +61,10 @@ async function handleSaveTweet(payload, sender) {
         vidIndex++;
         const ext = guessVideoExt(media.url);
         const localName = `${vidIndex}${ext}`;
-        const localPath = `assets/videos/${slug}/${localName}`;
         mediaDownloads.push({
-          url: media.url,
+          remoteUrl: media.url,
           type: media.type,
-          localPath,
+          localPath: `assets/videos/${slug}/${localName}`,
           dir: `assets/videos/${slug}`,
           localName,
         });
@@ -64,27 +72,19 @@ async function handleSaveTweet(payload, sender) {
     }
   }
 
-  // Build markdown with local paths
-  const localMediaUrls = mediaDownloads.map((d) => ({
-    type: d.type,
-    url: d.localPath,
-  }));
-  const markdownPayload = {
-    ...payload,
-    mediaUrls: localMediaUrls.length > 0 ? localMediaUrls : payload.mediaUrls,
-  };
-  const markdown = buildMarkdown(markdownPayload, settings, localMediaUrls.length > 0);
-
   const tabId = sender?.tab?.id;
   if (!tabId) {
     return { success: false, error: "无法获取当前标签页" };
   }
 
+  // Send payload + settings + media plan to content script
+  // Content script will: download media → build markdown → write files
   let result;
   try {
     result = await chrome.tabs.sendMessage(tabId, {
-      type: "WRITE_TO_FOLDER",
-      markdown,
+      type: "SAVE_TO_FOLDER",
+      payload,
+      settings,
       filename,
       mediaDownloads,
     });
@@ -127,9 +127,9 @@ function guessVideoExt(url) {
   return ".mp4";
 }
 
-// ── Markdown building ──
+// ── Markdown building (exported for content script via message) ──
 
-function buildMarkdown(payload, settings, hasLocalMedia) {
+function buildMarkdown(payload, settings, mediaUrlMap) {
   const sections = [];
 
   if (settings.includeFrontmatter) {
@@ -141,7 +141,7 @@ function buildMarkdown(payload, settings, hasLocalMedia) {
   sections.push(buildBody(payload));
 
   if (settings.includeMedia && payload.mediaUrls?.length > 0) {
-    sections.push(buildMediaSection(payload.mediaUrls, hasLocalMedia));
+    sections.push(buildMediaSection(payload.mediaUrls, mediaUrlMap));
   }
 
   if (payload.quotedTweet) {
@@ -212,7 +212,8 @@ function buildBody(payload) {
   return `## Content\n\n${text}`;
 }
 
-function buildMediaSection(mediaUrls, hasLocalMedia) {
+// mediaUrlMap: { remoteUrl -> localPath } for successfully downloaded media
+function buildMediaSection(mediaUrls, mediaUrlMap) {
   const lines = ["## Media", ""];
   const seen = new Set();
 
@@ -222,16 +223,15 @@ function buildMediaSection(mediaUrls, hasLocalMedia) {
     }
     seen.add(media.url);
 
+    // Use local path if downloaded, otherwise keep remote URL
+    const displayUrl = mediaUrlMap?.[media.url] || media.url;
+
     if (media.type === "image") {
-      lines.push(`![image](${media.url})`);
+      lines.push(`![image](${displayUrl})`);
     } else if (media.type === "video") {
-      if (hasLocalMedia) {
-        lines.push(`![video](${media.url})`);
-      } else {
-        lines.push(`[Video](${media.url})`);
-      }
+      lines.push(`[Video](${displayUrl})`);
     } else if (media.type === "video_thumbnail") {
-      lines.push(`![video thumbnail](${media.url})`);
+      lines.push(`![video thumbnail](${displayUrl})`);
     }
   }
 

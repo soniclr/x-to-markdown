@@ -29,8 +29,8 @@
       return true;
     }
 
-    if (message?.type === "WRITE_TO_FOLDER") {
-      writeFileToFolder(message.markdown, message.filename, message.mediaDownloads)
+    if (message?.type === "SAVE_TO_FOLDER") {
+      handleSaveToFolder(message)
         .then((result) => sendResponse(result))
         .catch((err) =>
           sendResponse({ success: false, error: err.message })
@@ -478,21 +478,10 @@
     }
   }
 
-  async function writeFileToFolder(markdown, filename, mediaDownloads) {
-    let dirHandle = cachedDirHandle || await getStoredHandle();
-
+  async function handleSaveToFolder({ payload, settings, filename, mediaDownloads }) {
+    const dirHandle = await ensureDirHandle();
     if (!dirHandle) {
-      try {
-        dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-        await storeHandle(dirHandle);
-        cachedDirHandle = dirHandle;
-        chrome.storage.local.set({ folderName: dirHandle.name });
-      } catch (err) {
-        if (err.name === "AbortError") {
-          return { success: false, error: "未选择文件夹" };
-        }
-        return { success: false, error: err.message };
-      }
+      return { success: false, error: "未选择文件夹" };
     }
 
     const permission = await dirHandle.queryPermission({ mode: "readwrite" });
@@ -503,31 +492,58 @@
       }
     }
 
+    // 1. Download media first, collect success map
+    const mediaUrlMap = {}; // remoteUrl -> localPath
+    let failedCount = 0;
+    if (mediaDownloads?.length > 0) {
+      const results = await downloadMediaFiles(dirHandle, mediaDownloads);
+      for (const r of results) {
+        if (r.success) {
+          mediaUrlMap[r.remoteUrl] = r.localPath;
+        } else {
+          failedCount++;
+        }
+      }
+    }
+
+    // 2. Ask background to build markdown with the success map
+    const { markdown } = await sendToBackground({
+      type: "BUILD_MARKDOWN",
+      payload,
+      settings,
+      mediaUrlMap,
+    });
+
+    // 3. Write markdown file
     try {
-      // Write markdown file
       const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
       const writable = await fileHandle.createWritable();
       await writable.write(markdown);
       await writable.close();
 
-      // Download media files
-      if (mediaDownloads?.length > 0) {
-        const results = await downloadMediaFiles(dirHandle, mediaDownloads);
-        const failed = results.filter((r) => !r.success);
-        if (failed.length > 0) {
-          return {
-            success: true,
-            message: `已保存到 ${dirHandle.name}/${filename}（${failed.length} 个媒体下载失败）`,
-          };
-        }
-      }
+      const msg = failedCount > 0
+        ? `已保存到 ${dirHandle.name}/${filename}（${failedCount} 个媒体下载失败）`
+        : `已保存到 ${dirHandle.name}/${filename}`;
 
-      return {
-        success: true,
-        message: `已保存到 ${dirHandle.name}/${filename}`,
-      };
+      return { success: true, message: msg };
     } catch (err) {
       return { success: false, error: "写入文件失败: " + err.message };
+    }
+  }
+
+  async function ensureDirHandle() {
+    let dirHandle = cachedDirHandle || await getStoredHandle();
+    if (dirHandle) return dirHandle;
+
+    try {
+      dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+      await storeHandle(dirHandle);
+      cachedDirHandle = dirHandle;
+      chrome.storage.local.set({ folderName: dirHandle.name });
+      return dirHandle;
+    } catch (err) {
+      if (err.name === "AbortError") return null;
+      throw err;
     }
   }
 
@@ -544,9 +560,9 @@
 
     for (const media of mediaDownloads) {
       try {
-        const response = await fetch(media.url, { mode: "cors" });
+        const response = await fetch(media.remoteUrl, { mode: "cors" });
         if (!response.ok) {
-          results.push({ success: false, url: media.url, error: response.statusText });
+          results.push({ success: false, remoteUrl: media.remoteUrl });
           continue;
         }
         const blob = await response.blob();
@@ -559,9 +575,9 @@
         await writable.write(blob);
         await writable.close();
 
-        results.push({ success: true, url: media.url });
-      } catch (err) {
-        results.push({ success: false, url: media.url, error: err.message });
+        results.push({ success: true, remoteUrl: media.remoteUrl, localPath: media.localPath });
+      } catch (_err) {
+        results.push({ success: false, remoteUrl: media.remoteUrl });
       }
     }
 
