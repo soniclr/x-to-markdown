@@ -41,20 +41,34 @@ async function handleSaveTweet(payload, sender) {
   if (settings.includeMedia && payload.mediaUrls?.length > 0) {
     const seen = new Set();
     let imgIndex = 0;
+    let vidIndex = 0;
     for (const media of payload.mediaUrls) {
       if (seen.has(media.url)) continue;
       seen.add(media.url);
 
-      imgIndex++;
-      const ext = guessImageExt(media.url);
-      const localName = `${imgIndex}${ext}`;
-      mediaDownloads.push({
-        remoteUrl: media.url,
-        type: media.type,
-        localPath: `assets/img/${slug}/${localName}`,
-        dir: `assets/img/${slug}`,
-        localName,
-      });
+      if (media.type === "video") {
+        vidIndex++;
+        const ext = guessVideoExt(media.url);
+        const localName = `${vidIndex}${ext}`;
+        mediaDownloads.push({
+          remoteUrl: media.url,
+          type: media.type,
+          localPath: `assets/videos/${slug}/${localName}`,
+          dir: `assets/videos/${slug}`,
+          localName,
+        });
+      } else {
+        imgIndex++;
+        const ext = guessImageExt(media.url);
+        const localName = `${imgIndex}${ext}`;
+        mediaDownloads.push({
+          remoteUrl: media.url,
+          type: media.type,
+          localPath: `assets/img/${slug}/${localName}`,
+          dir: `assets/img/${slug}`,
+          localName,
+        });
+      }
     }
   }
 
@@ -102,6 +116,14 @@ function guessImageExt(url) {
     if (pathname.includes(".webp")) return ".webp";
   } catch (_e) { /* ignore */ }
   return ".jpg";
+}
+
+function guessVideoExt(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    if (pathname.includes(".webm")) return ".webm";
+  } catch (_e) { /* ignore */ }
+  return ".mp4";
 }
 
 // ── Markdown building (exported for content script via message) ──
@@ -204,6 +226,8 @@ function buildMediaSection(mediaUrls, mediaUrlMap) {
 
     if (media.type === "image") {
       lines.push(`![image](${displayUrl})`);
+    } else if (media.type === "video") {
+      lines.push(`[Video](${displayUrl})`);
     } else if (media.type === "video_thumbnail") {
       lines.push(`![video thumbnail](${displayUrl})`);
     }

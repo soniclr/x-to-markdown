@@ -21,6 +21,17 @@
         "https://twitter.com/*"
       ],
       "js": [
+        "injector.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ],
+      "js": [
         "content.js"
       ],
       "css": [

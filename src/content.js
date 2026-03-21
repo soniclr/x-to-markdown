@@ -11,8 +11,16 @@
   const HANDLE_KEY = "saveDir";
 
   let cachedDirHandle = null;
+  const videoUrlCache = {}; // tweetId -> mp4 URL
 
   init();
+
+  // Listen for video URLs from injector.js (MAIN world)
+  window.addEventListener("message", (event) => {
+    if (event.data?.type === "XTM_VIDEO_FOUND") {
+      videoUrlCache[event.data.tweetId] = event.data.videoUrl;
+    }
+  });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "FOLDER_UPDATED") {
@@ -291,17 +299,18 @@
       statusLink?.href || statusLink?.getAttribute("href") || ""
     );
     const tweetIdMatch = url.match(/status\/(\d+)/);
+    const tweetId = tweetIdMatch ? tweetIdMatch[1] : "";
 
     return {
       url,
-      tweetId: tweetIdMatch ? tweetIdMatch[1] : "",
+      tweetId,
       authorHandle: extractHandle(article),
       authorName: extractAuthorName(article),
       text: extractText(article),
       publishedAt: extractPublishedTime(article),
       capturedAt: new Date().toISOString(),
       metrics: extractMetrics(article),
-      mediaUrls: extractMediaUrls(article),
+      mediaUrls: extractMediaUrls(article, tweetId),
       quotedTweet: extractQuotedTweet(article),
     };
   }
@@ -394,7 +403,7 @@
     return metrics;
   }
 
-  function extractMediaUrls(article) {
+  function extractMediaUrls(article, tweetId) {
     const urls = [];
     const images = article.querySelectorAll('[data-testid="tweetPhoto"] img[src]');
     for (const img of images) {
@@ -403,7 +412,11 @@
         urls.push({ type: "image", url: cleanImageUrl(src) });
       }
     }
-    // Video: only poster (thumbnail) is downloadable; blob: src cannot be fetched
+    // Video: use intercepted mp4 URL if available, otherwise save poster
+    const videoUrl = tweetId ? videoUrlCache[tweetId] : null;
+    if (videoUrl) {
+      urls.push({ type: "video", url: videoUrl });
+    }
     const videoEls = article.querySelectorAll("video[poster]");
     for (const vid of videoEls) {
       const poster = vid.getAttribute("poster");
