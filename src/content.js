@@ -560,7 +560,7 @@
 
     for (const media of mediaDownloads) {
       try {
-        const response = await fetch(media.remoteUrl, { mode: "cors" });
+        const response = await fetch(media.remoteUrl);
         if (!response.ok) {
           results.push({ success: false, remoteUrl: media.remoteUrl });
           continue;
@@ -576,7 +576,8 @@
         await writable.close();
 
         results.push({ success: true, remoteUrl: media.remoteUrl, localPath: media.localPath });
-      } catch (_err) {
+      } catch (err) {
+        showToast(`媒体下载失败: ${err.message}`, "error");
         results.push({ success: false, remoteUrl: media.remoteUrl });
       }
     }
