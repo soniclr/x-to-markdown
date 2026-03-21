@@ -135,12 +135,19 @@ function buildMarkdown(payload, settings, mediaUrlMap) {
     sections.push(buildFrontmatter(payload));
   }
 
-  sections.push(buildHeading(payload));
-  sections.push(buildInfoBlock(payload, settings));
-  sections.push(buildBody(payload));
+  if (payload.isArticle) {
+    // Long-form article: use article title as heading, render blocks inline
+    sections.push(buildArticleHeading(payload));
+    sections.push(buildInfoBlock(payload, settings));
+    sections.push(buildArticleBody(payload.contentBlocks, mediaUrlMap));
+  } else {
+    sections.push(buildHeading(payload));
+    sections.push(buildInfoBlock(payload, settings));
+    sections.push(buildBody(payload));
 
-  if (settings.includeMedia && payload.mediaUrls?.length > 0) {
-    sections.push(buildMediaSection(payload.mediaUrls, mediaUrlMap));
+    if (settings.includeMedia && payload.mediaUrls?.length > 0) {
+      sections.push(buildMediaSection(payload.mediaUrls, mediaUrlMap));
+    }
   }
 
   if (payload.quotedTweet) {
@@ -161,7 +168,8 @@ function buildFrontmatter(payload) {
     `url: ${payload.url}`,
     `author: ${author}`,
     `published: ${published}`,
-    "source: X (Twitter)",
+    `source: X (Twitter)`,
+    payload.isArticle ? "type: article" : "type: tweet",
     `saved_at: ${now}`,
     "---",
   ];
@@ -172,6 +180,34 @@ function buildFrontmatter(payload) {
 function buildHeading(payload) {
   const title = sanitizeTitle(payload.text || payload.tweetId || "x-post");
   return `# ${title}`;
+}
+
+function buildArticleHeading(payload) {
+  const title = payload.articleTitle || sanitizeTitle(
+    payload.contentBlocks?.find((b) => b.type === "text")?.content || payload.tweetId || "x-article"
+  );
+  return `# ${title}`;
+}
+
+function buildArticleBody(contentBlocks, mediaUrlMap) {
+  if (!contentBlocks || contentBlocks.length === 0) {
+    return "## Content\n\n*(empty article)*";
+  }
+
+  const lines = ["## Content", ""];
+
+  for (const block of contentBlocks) {
+    if (block.type === "text") {
+      lines.push(block.content);
+      lines.push(""); // blank line between blocks
+    } else if (block.type === "image") {
+      const displayUrl = mediaUrlMap?.[block.url] || block.url;
+      lines.push(`![image](${displayUrl})`);
+      lines.push("");
+    }
+  }
+
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function buildInfoBlock(payload, settings) {
@@ -255,7 +291,10 @@ function buildQuoteSection(qt) {
 }
 
 function buildFilename(payload) {
-  const title = sanitizeTitle(payload.text || payload.tweetId || "x-post");
+  const titleSource = payload.isArticle
+    ? (payload.articleTitle || payload.contentBlocks?.find((b) => b.type === "text")?.content || payload.tweetId || "x-article")
+    : (payload.text || payload.tweetId || "x-post");
+  const title = sanitizeTitle(titleSource);
   const dateStr = formatDate(payload.publishedAt || new Date().toISOString());
   const handle = payload.authorHandle || "unknown";
   return sanitizeFilename(`${dateStr}-${handle}-${title}`);

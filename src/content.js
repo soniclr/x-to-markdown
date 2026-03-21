@@ -12,13 +12,20 @@
 
   let cachedDirHandle = null;
   const videoUrlCache = {}; // tweetId -> mp4 URL
+  const articleDataCache = {}; // tweetId -> { type: "note"|"article", data: {...} }
 
   init();
 
-  // Listen for video URLs from injector.js (MAIN world)
+  // Listen for video URLs and article data from injector.js (MAIN world)
   window.addEventListener("message", (event) => {
     if (event.data?.type === "XTM_VIDEO_FOUND") {
       videoUrlCache[event.data.tweetId] = event.data.videoUrl;
+    }
+    if (event.data?.type === "XTM_ARTICLE_FOUND") {
+      articleDataCache[event.data.tweetId] = {
+        type: event.data.articleType,
+        data: event.data.articleData,
+      };
     }
   });
 
@@ -301,7 +308,10 @@
     const tweetIdMatch = url.match(/status\/(\d+)/);
     const tweetId = tweetIdMatch ? tweetIdMatch[1] : "";
 
-    return {
+    // Check if we have API-sourced article/note data for this tweet
+    const cachedArticle = tweetId ? articleDataCache[tweetId] : null;
+
+    const data = {
       url,
       tweetId,
       authorHandle: extractHandle(article),
@@ -313,6 +323,199 @@
       mediaUrls: extractMediaUrls(article, tweetId),
       quotedTweet: extractQuotedTweet(article),
     };
+
+    if (cachedArticle?.type === "note") {
+      const noteBlocks = buildNoteBlocks(cachedArticle.data);
+      if (noteBlocks.length > 0) {
+        data.isArticle = true;
+        data.articleTitle = noteBlocks[0]?.content?.split("\n")[0]?.slice(0, 100) || "";
+        data.contentBlocks = noteBlocks;
+        // Collect image URLs from note inline media for downloading
+        data.mediaUrls = noteBlocks
+          .filter((b) => b.type === "image")
+          .map((b) => ({ type: "image", url: b.url }));
+      }
+    } else if (cachedArticle?.type === "article") {
+      const articleBlocks = buildArticleBlocks(cachedArticle.data);
+      if (articleBlocks.length > 0) {
+        data.isArticle = true;
+        data.articleTitle = cachedArticle.data.title || "";
+        data.contentBlocks = articleBlocks;
+        data.text = "";
+        // Collect image URLs from article blocks for downloading
+        data.mediaUrls = articleBlocks
+          .filter((b) => b.type === "image")
+          .map((b) => ({ type: "image", url: b.url }));
+      }
+    }
+
+    return data;
+  }
+
+  // ── Note (long-form tweet) content block building ──
+
+  function buildNoteBlocks(noteData) {
+    const blocks = [];
+    const text = noteData.text || "";
+    if (!text) return blocks;
+
+    const inlineMedia = noteData.inlineMedia || [];
+    const mediaEntities = noteData.mediaEntities || [];
+
+    // Build a map of media_id -> best image URL
+    const mediaUrlMap = {};
+    for (const entity of mediaEntities) {
+      if (entity.media_key || entity.id_str) {
+        const key = entity.media_key || entity.id_str;
+        const url = entity.media_url_https || entity.media_url || "";
+        if (url) {
+          mediaUrlMap[key] = cleanImageUrl(url);
+        }
+      }
+    }
+
+    if (inlineMedia.length === 0) {
+      // No inline media — just return the full text as a single block
+      blocks.push({ type: "text", content: text });
+      return blocks;
+    }
+
+    // Sort inline media by index (character position in text)
+    const sortedMedia = [...inlineMedia].sort((a, b) => a.index - b.index);
+
+    // Split text at inline media insertion points
+    let lastIndex = 0;
+    for (const media of sortedMedia) {
+      const insertAt = media.index;
+      if (insertAt > lastIndex) {
+        const textChunk = text.slice(lastIndex, insertAt).trim();
+        if (textChunk) {
+          blocks.push({ type: "text", content: textChunk });
+        }
+      }
+      // Find the image URL for this media
+      const mediaUrl = mediaUrlMap[media.media_id] || "";
+      if (mediaUrl) {
+        blocks.push({ type: "image", url: mediaUrl });
+      }
+      lastIndex = insertAt;
+    }
+
+    // Remaining text after last inline media
+    if (lastIndex < text.length) {
+      const remaining = text.slice(lastIndex).trim();
+      if (remaining) {
+        blocks.push({ type: "text", content: remaining });
+      }
+    }
+
+    return blocks;
+  }
+
+  // ── Article (X Articles with Draft.js content_state) content block building ──
+
+  function buildArticleBlocks(articleData) {
+    const blocks = [];
+    const contentState = articleData.contentState;
+
+    if (!contentState?.blocks) {
+      // Fallback to plain text if no content_state
+      const plainText = articleData.previewText || "";
+      if (plainText) {
+        blocks.push({ type: "text", content: plainText });
+      }
+      return blocks;
+    }
+
+    const entityMap = contentState.entityMap || {};
+
+    // Build media URL map from article media_entities
+    const mediaUrlMap = {};
+    for (const entity of (articleData.mediaEntities || [])) {
+      const key = entity.media_id || entity.media_key || entity.id_str;
+      const url = entity.media_info?.original_img_url ||
+        entity.media_url_https || entity.media_url || "";
+      if (key && url) {
+        mediaUrlMap[key] = cleanImageUrl(url);
+      }
+    }
+
+    for (const block of contentState.blocks) {
+      const blockType = block.type || "unstyled";
+
+      if (blockType === "atomic") {
+        // Atomic blocks contain media/embeds via entity ranges
+        for (const range of (block.entityRanges || [])) {
+          const entity = entityMap[String(range.key)];
+          if (!entity) continue;
+          const eType = entity.type || entity.value?.type || "";
+          const eData = entity.data || entity.value?.data || entity.value || {};
+
+          if (eType === "MEDIA" || eType === "IMAGE") {
+            // Find image URL from media items or direct URL
+            const mediaItems = eData.mediaItems || [];
+            if (mediaItems.length > 0) {
+              for (const item of mediaItems) {
+                const url = item.media_info?.original_img_url ||
+                  item.media_url_https || mediaUrlMap[item.media_id] || "";
+                if (url) {
+                  blocks.push({ type: "image", url: cleanImageUrl(url) });
+                }
+              }
+            } else if (eData.url) {
+              blocks.push({ type: "image", url: cleanImageUrl(eData.url) });
+            }
+          } else if (eType === "TWEET") {
+            const tweetUrl = eData.tweetId
+              ? `https://x.com/i/status/${eData.tweetId}`
+              : "";
+            if (tweetUrl) {
+              blocks.push({ type: "text", content: `[Embedded Tweet](${tweetUrl})` });
+            }
+          } else if (eType === "LINK") {
+            const linkUrl = eData.url || "";
+            if (linkUrl) {
+              blocks.push({ type: "text", content: `[${linkUrl}](${linkUrl})` });
+            }
+          }
+        }
+        continue;
+      }
+
+      // Text-based blocks
+      const text = (block.text || "").trim();
+      if (!text) {
+        // Empty block = paragraph break, skip
+        continue;
+      }
+
+      // Apply block-level formatting
+      let content = text;
+      if (blockType === "header-one") {
+        content = `# ${text}`;
+      } else if (blockType === "header-two") {
+        content = `## ${text}`;
+      } else if (blockType === "header-three") {
+        content = `### ${text}`;
+      } else if (blockType.startsWith("header-")) {
+        const level = blockType.replace("header-", "");
+        const levelMap = { four: 4, five: 5, six: 6 };
+        const n = levelMap[level] || 4;
+        content = `${"#".repeat(n)} ${text}`;
+      } else if (blockType === "blockquote") {
+        content = `> ${text}`;
+      } else if (blockType === "code-block") {
+        content = "```\n" + text + "\n```";
+      } else if (blockType === "unordered-list-item") {
+        content = `- ${text}`;
+      } else if (blockType === "ordered-list-item") {
+        content = `1. ${text}`;
+      }
+
+      blocks.push({ type: "text", content });
+    }
+
+    return blocks;
   }
 
   function extractText(article) {

@@ -1,4 +1,4 @@
-// Injected into page MAIN world to intercept XHR/fetch for video URLs.
+// Injected into page MAIN world to intercept XHR/fetch for video URLs and article content.
 // Communicates with content script via window.postMessage.
 (function () {
   "use strict";
@@ -8,6 +8,8 @@
 
   // Store: tweetId -> best mp4 URL (highest bitrate)
   const videoMap = {};
+  // Store: tweetId -> note/article data
+  const articleMap = {};
 
   // ── Intercept fetch ──
   const originalFetch = window.fetch;
@@ -18,7 +20,7 @@
     if (TWEET_API_RE.test(url)) {
       try {
         const clone = response.clone();
-        clone.json().then((data) => extractVideoUrls(data)).catch(() => {});
+        clone.json().then((data) => extractTweetData(data)).catch(() => {});
       } catch (_e) { /* ignore */ }
     }
 
@@ -39,15 +41,15 @@
       this.addEventListener("load", function () {
         try {
           const data = JSON.parse(this.responseText);
-          extractVideoUrls(data);
+          extractTweetData(data);
         } catch (_e) { /* ignore */ }
       });
     }
     return originalSend.apply(this, args);
   };
 
-  // ── Extract mp4 URLs from API response ──
-  function extractVideoUrls(data) {
+  // ── Extract data from API response ──
+  function extractTweetData(data) {
     try {
       walkObject(data);
     } catch (_e) { /* ignore */ }
@@ -56,9 +58,11 @@
   function walkObject(obj) {
     if (!obj || typeof obj !== "object") return;
 
-    // Look for tweet result objects with video info
+    // Look for tweet result objects with video info or article/note data
     if (obj.rest_id && obj.legacy) {
       const tweetId = obj.rest_id;
+
+      // Extract video URLs
       const mediaEntities =
         obj.legacy?.extended_entities?.media ||
         obj.legacy?.entities?.media ||
@@ -82,6 +86,43 @@
           }
         }
       }
+
+      // Extract Note (long-form tweet) content
+      const noteResult = obj.note_tweet?.note_tweet_results?.result;
+      if (noteResult) {
+        const noteData = {
+          text: noteResult.text || "",
+          richTextTags: noteResult.richtext?.richtext_tags || [],
+          inlineMedia: noteResult.media?.inline_media || [],
+          mediaEntities: mediaEntities,
+        };
+        articleMap[tweetId] = { type: "note", data: noteData };
+        window.postMessage({
+          type: "XTM_ARTICLE_FOUND",
+          tweetId,
+          articleType: "note",
+          articleData: noteData,
+        }, "*");
+      }
+
+      // Extract Article (full long-form article) content
+      const articleResult = obj.article?.article_results?.result;
+      if (articleResult) {
+        const articleData = {
+          title: articleResult.title || "",
+          previewText: articleResult.preview_text || "",
+          contentState: articleResult.content_state || null,
+          coverMedia: articleResult.cover_media || null,
+          mediaEntities: articleResult.media_entities || [],
+        };
+        articleMap[tweetId] = { type: "article", data: articleData };
+        window.postMessage({
+          type: "XTM_ARTICLE_FOUND",
+          tweetId,
+          articleType: "article",
+          articleData: articleData,
+        }, "*");
+      }
     }
 
     // Recurse
@@ -97,7 +138,6 @@
   function cleanVideoUrl(url) {
     try {
       const u = new URL(url);
-      // Remove tracking params, keep only the base mp4 URL
       return u.origin + u.pathname;
     } catch (_e) {
       return url;
@@ -111,6 +151,13 @@
         type: "XTM_VIDEO_RESULT",
         tweetId: event.data.tweetId,
         videoUrl: videoMap[event.data.tweetId] || null,
+      }, "*");
+    }
+    if (event.data?.type === "XTM_GET_ARTICLE" && event.data?.tweetId) {
+      window.postMessage({
+        type: "XTM_ARTICLE_RESULT",
+        tweetId: event.data.tweetId,
+        articleInfo: articleMap[event.data.tweetId] || null,
       }, "*");
     }
   });
