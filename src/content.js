@@ -462,6 +462,8 @@
 
     const inlineMedia = noteData.inlineMedia || [];
     const mediaEntities = noteData.mediaEntities || [];
+
+    // DEBUG: 临时调试日志，排查图片偏移问题
     // domImages: array of image URLs extracted from the DOM (reliable, downloadable)
 
     // Try to build image URL list from API media entities first
@@ -482,27 +484,32 @@
       return blocks;
     }
 
+    // 题图 = domImages 中的第一张（从 tweetPhoto 容器提取），不在 inlineMedia 中
+    // inlineMedia 中的每一项都是正文中的内联图片
+    // 所以：题图放最前面，inlineMedia[i] 对应 imageUrls[i+1]
+    blocks.push({ type: "image", url: imageUrls[0] });
+
+    const contentImages = imageUrls.slice(1);
+
     // Sort inline media by index (character position in text)
     const sortedMedia = [...inlineMedia].sort((a, b) => a.index - b.index);
 
-    // Split text at inline media insertion points
-    // Use positional matching: 1st inline_media → 1st image URL, etc.
     let lastIndex = 0;
-    let mediaSeqIdx = 0;
-    for (const media of sortedMedia) {
-      const insertAt = media.index;
+    for (let i = 0; i < sortedMedia.length; i++) {
+      const insertAt = sortedMedia[i].index;
+
       if (insertAt > lastIndex) {
         const textChunk = text.slice(lastIndex, insertAt).trim();
         if (textChunk) {
           blocks.push({ type: "text", content: textChunk });
         }
       }
-      const mediaUrl = imageUrls[mediaSeqIdx] || "";
+      lastIndex = insertAt;
+
+      const mediaUrl = contentImages[i] || "";
       if (mediaUrl) {
         blocks.push({ type: "image", url: mediaUrl });
       }
-      mediaSeqIdx++;
-      lastIndex = insertAt;
     }
 
     // Remaining text after last inline media
@@ -514,8 +521,8 @@
     }
 
     // Any remaining images that weren't matched to inline positions
-    for (let i = mediaSeqIdx; i < imageUrls.length; i++) {
-      blocks.push({ type: "image", url: imageUrls[i] });
+    for (let i = sortedMedia.length; i < contentImages.length; i++) {
+      blocks.push({ type: "image", url: contentImages[i] });
     }
 
     return blocks;
@@ -646,21 +653,27 @@
     }
 
     // If API didn't resolve any images but we have DOM images, use DOM as fallback
+    // domImages[0] is the cover image (from tweetPhoto container), rest are inline content images
     if (apiImageCount === 0 && domImages && domImages.length > 0) {
-      if (atomicPositions.length > 0) {
-        // Insert DOM images at atomic block positions (reverse to preserve indices)
-        // Match as many as possible; extra images go at the end
-        const insertCount = Math.min(atomicPositions.length, domImages.length);
+      // Insert cover image at the very beginning
+      blocks.splice(0, 0, { type: "image", url: domImages[0] });
+
+      // Remaining images (content images) map to atomic block positions
+      const contentImages = domImages.slice(1);
+
+      if (atomicPositions.length > 0 && contentImages.length > 0) {
+        // atomicPositions were recorded before the cover insert, so shift by 1
+        const insertCount = Math.min(atomicPositions.length, contentImages.length);
         for (let i = insertCount - 1; i >= 0; i--) {
-          blocks.splice(atomicPositions[i], 0, { type: "image", url: domImages[i] });
+          blocks.splice(atomicPositions[i] + 1, 0, { type: "image", url: contentImages[i] });
         }
         // Append remaining images that don't have atomic positions
-        for (let i = insertCount; i < domImages.length; i++) {
-          blocks.push({ type: "image", url: domImages[i] });
+        for (let i = insertCount; i < contentImages.length; i++) {
+          blocks.push({ type: "image", url: contentImages[i] });
         }
       } else {
-        // No atomic blocks at all — append images at end
-        for (const url of domImages) {
+        // No atomic blocks — append content images at end
+        for (const url of contentImages) {
           blocks.push({ type: "image", url });
         }
       }
