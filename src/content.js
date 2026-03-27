@@ -9,10 +9,12 @@
   const DB_NAME = "xtm-folder-db";
   const STORE_NAME = "handles";
   const HANDLE_KEY = "saveDir";
+  const ARTICLE_FETCH_TIMEOUT_MS = 350;
 
   let cachedDirHandle = null;
   const videoUrlCache = {}; // tweetId -> mp4 URL
   const articleDataCache = {}; // tweetId -> { type: "note"|"article", data: {...} }
+  const pendingArticleWaiters = new Map(); // tweetId -> [{ resolve, timer }]
 
   init();
 
@@ -22,10 +24,13 @@
       videoUrlCache[event.data.tweetId] = event.data.videoUrl;
     }
     if (event.data?.type === "XTM_ARTICLE_FOUND") {
-      articleDataCache[event.data.tweetId] = {
+      cacheArticleData(event.data.tweetId, {
         type: event.data.articleType,
         data: event.data.articleData,
-      };
+      });
+    }
+    if (event.data?.type === "XTM_ARTICLE_RESULT" && event.data?.articleInfo) {
+      cacheArticleData(event.data.tweetId, event.data.articleInfo);
     }
   });
 
@@ -230,7 +235,7 @@
 
     btn.classList.add("xtm-fab-saving");
     try {
-      const tweetData = extractTweetData(article);
+      const tweetData = await extractTweetData(article);
       if (!tweetData.url) {
         showToast("无法识别帖子链接", "error");
         return;
@@ -294,7 +299,7 @@
     btn.classList.add("xtm-saving");
 
     try {
-      const tweetData = extractTweetData(article);
+      const tweetData = await extractTweetData(article);
       if (!tweetData.url) {
         showToast("无法识别帖子链接", "error");
         return;
@@ -315,7 +320,7 @@
 
   // ── Tweet data extraction ──
 
-  function extractTweetData(article) {
+  async function extractTweetData(article) {
     // On detail pages, use URL for tweetId (more reliable than DOM link)
     const pathMatch = window.location.pathname.match(/\/([^/]+)\/status\/(\d+)/);
     let url = "";
@@ -333,8 +338,8 @@
       tweetId = match ? match[1] : "";
     }
 
-    // Check if we have API-sourced article/note data for this tweet
-    const cachedArticle = tweetId ? articleDataCache[tweetId] : null;
+    // Check if we have API-sourced article/note data for this tweet.
+    let cachedArticle = tweetId ? articleDataCache[tweetId] : null;
 
     // Always extract DOM images — these are reliable, working URLs
     const domMediaUrls = extractMediaUrls(article, tweetId);
@@ -352,52 +357,16 @@
       quotedTweet: extractQuotedTweet(article),
     };
 
-    // If no API cache and text is empty, try broader DOM extraction
-    // Long-form notes may render content outside the article element
-    if (!cachedArticle && !data.text) {
-      // Search the entire primary column, not just the article
-      const primaryCol = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+    // Only request injector cache when body text is empty (likely long-form content card),
+    // to avoid slowing down normal tweet saves.
+    if (!cachedArticle && tweetId && !data.text && pathMatch) {
+      cachedArticle = await requestArticleDataFromInjector(tweetId);
+    }
 
-      // Collect all tweetText and pbs.twimg images in DOM order
-      const selector = '[data-testid="tweetText"], img[src*="pbs.twimg.com/media/"]';
-      const nodes = primaryCol.querySelectorAll(selector);
-      const contentBlocks = [];
-      const seenText = new Set();
-      const seenImg = new Set();
-
-      for (const node of nodes) {
-        // Skip content inside reply tweets (articles after the main one)
-        // but include content that's NOT in any article (long-form body)
-        if (node.closest('[data-testid="quoteTweet"]')) continue;
-
-        // For nodes inside an article, only include if it's the main article
-        const parentArticle = node.closest('article[data-testid="tweet"]');
-        if (parentArticle && parentArticle !== article) {
-          // Check if this article comes AFTER the main tweet (i.e. it's a reply)
-          // by comparing document position
-          if (article.compareDocumentPosition(parentArticle) & Node.DOCUMENT_POSITION_FOLLOWING) {
-            continue; // Skip replies
-          }
-        }
-
-        if (node.matches('[data-testid="tweetText"]')) {
-          const t = node.innerText?.trim();
-          if (t && !seenText.has(t)) {
-            seenText.add(t);
-            contentBlocks.push({ type: "text", content: t });
-          }
-        } else if (node.tagName === "IMG") {
-          const src = node.getAttribute("src") || "";
-          if (src && !src.includes("emoji") && !src.includes("profile_images")) {
-            const clean = cleanImageUrl(src);
-            if (!seenImg.has(clean)) {
-              seenImg.add(clean);
-              contentBlocks.push({ type: "image", url: clean });
-            }
-          }
-        }
-      }
-
+    // If no API cache and text is empty, fall back to DOM extraction in strict DOM order.
+    // This path now includes code blocks to avoid missing long-form technical content.
+    if (!cachedArticle && !data.text && pathMatch) {
+      const contentBlocks = extractDomArticleBlocks(article);
       if (contentBlocks.length > 0) {
         const textParts = contentBlocks.filter((b) => b.type === "text");
         data.text = textParts.map((b) => b.content).join("\n\n");
@@ -573,6 +542,7 @@
 
       if (blockType === "atomic") {
         // Atomic blocks contain media/embeds via entity ranges
+        let handledAtomic = false;
         let foundImage = false;
         for (const range of (block.entityRanges || [])) {
           const entity = entityMap[String(range.key)];
@@ -590,13 +560,21 @@
                 if (url) {
                   blocks.push({ type: "image", url: cleanImageUrl(url) });
                   apiImageCount++;
+                  handledAtomic = true;
                   foundImage = true;
                 }
               }
             } else if (eData.url) {
               blocks.push({ type: "image", url: cleanImageUrl(eData.url) });
               apiImageCount++;
+              handledAtomic = true;
               foundImage = true;
+            }
+          } else if (eType === "CODE" || eType === "CODE_BLOCK" || eType === "PRE") {
+            const codeText = extractCodeTextFromEntityData(eData);
+            if (codeText) {
+              blocks.push({ type: "text", content: toCodeFence(codeText) });
+              handledAtomic = true;
             }
           } else if (eType === "TWEET") {
             const tweetUrl = eData.tweetId
@@ -604,27 +582,43 @@
               : "";
             if (tweetUrl) {
               blocks.push({ type: "text", content: `[Embedded Tweet](${tweetUrl})` });
+              handledAtomic = true;
             }
           } else if (eType === "LINK") {
             const linkUrl = eData.url || "";
             if (linkUrl) {
               blocks.push({ type: "text", content: `[${linkUrl}](${linkUrl})` });
+              handledAtomic = true;
             }
           }
         }
         // Record position for DOM image fallback
-        if (!foundImage) {
+        if (!handledAtomic && !foundImage) {
           atomicPositions.push(blocks.length);
         }
         continue;
       }
 
-      // Text-based blocks
-      const text = (block.text || "").trim();
-      if (!text) {
+      // Group consecutive code-block items into a single fenced code block
+      if (blockType === "code-block" || blockType === "code" || blockType === "pre") {
+        const codeLines = [block.text || ""];
+        while (i + 1 < contentState.blocks.length &&
+               ["code-block", "code", "pre"].includes(contentState.blocks[i + 1].type || "unstyled")) {
+          i++;
+          codeLines.push(contentState.blocks[i].text || "");
+        }
+        blocks.push({ type: "text", content: toCodeFence(codeLines.join("\n")) });
+        continue;
+      }
+
+      // Text-based blocks — apply inline styles and entity links
+      const rawText = block.text || "";
+      if (!rawText.trim()) {
         // Empty block = paragraph break, skip
         continue;
       }
+
+      const text = applyInlineFormatting(rawText, block.inlineStyleRanges || [], block.entityRanges || [], entityMap);
 
       // Apply block-level formatting
       let content = text;
@@ -641,8 +635,6 @@
         content = `${"#".repeat(n)} ${text}`;
       } else if (blockType === "blockquote") {
         content = `> ${text}`;
-      } else if (blockType === "code-block") {
-        content = "```\n" + text + "\n```";
       } else if (blockType === "unordered-list-item") {
         content = `- ${text}`;
       } else if (blockType === "ordered-list-item") {
@@ -680,6 +672,316 @@
     }
 
     return blocks;
+  }
+
+  // ── Apply Draft.js inline styles and entity links to text ──
+
+  function applyInlineFormatting(text, inlineStyleRanges, entityRanges, entityMap) {
+    if ((!inlineStyleRanges || inlineStyleRanges.length === 0) &&
+        (!entityRanges || entityRanges.length === 0)) {
+      return text;
+    }
+
+    // Build a per-character annotation array
+    const len = text.length;
+    const chars = new Array(len);
+    for (let i = 0; i < len; i++) {
+      chars[i] = { styles: new Set(), entity: null };
+    }
+
+    for (const range of inlineStyleRanges) {
+      const start = range.offset;
+      const end = Math.min(start + range.length, len);
+      for (let i = start; i < end; i++) {
+        chars[i].styles.add(range.style);
+      }
+    }
+
+    for (const range of entityRanges) {
+      const start = range.offset;
+      const end = Math.min(start + range.length, len);
+      const entity = entityMap[String(range.key)];
+      if (!entity) continue;
+      for (let i = start; i < end; i++) {
+        chars[i].entity = entity;
+      }
+    }
+
+    // Group consecutive characters with the same formatting
+    const segments = [];
+    let segStart = 0;
+    for (let i = 1; i <= len; i++) {
+      if (i < len &&
+          sameStyles(chars[i].styles, chars[segStart].styles) &&
+          chars[i].entity === chars[segStart].entity) {
+        continue;
+      }
+      segments.push({
+        text: text.slice(segStart, i),
+        styles: chars[segStart].styles,
+        entity: chars[segStart].entity,
+      });
+      segStart = i;
+    }
+
+    // Render each segment
+    const parts = [];
+    for (const seg of segments) {
+      let s = seg.text;
+
+      // Apply inline styles (CODE first, since it shouldn't nest bold/italic)
+      if (seg.styles.has("CODE")) {
+        s = "`" + s + "`";
+      } else {
+        if (seg.styles.has("BOLD")) {
+          s = "**" + s + "**";
+        }
+        if (seg.styles.has("ITALIC")) {
+          s = "_" + s + "_";
+        }
+        if (seg.styles.has("STRIKETHROUGH")) {
+          s = "~~" + s + "~~";
+        }
+      }
+
+      // Apply entity link
+      if (seg.entity) {
+        const eType = seg.entity.type || seg.entity.value?.type || "";
+        const eData = seg.entity.data || seg.entity.value?.data || seg.entity.value || {};
+        if (eType === "LINK" && eData.url) {
+          s = `[${s}](${eData.url})`;
+        }
+      }
+
+      parts.push(s);
+    }
+
+    return parts.join("");
+  }
+
+  function sameStyles(a, b) {
+    if (a.size !== b.size) return false;
+    for (const s of a) {
+      if (!b.has(s)) return false;
+    }
+    return true;
+  }
+
+  function cacheArticleData(tweetId, articleInfo) {
+    if (!tweetId || !articleInfo?.type || !articleInfo?.data) {
+      return;
+    }
+    articleDataCache[tweetId] = articleInfo;
+
+    const waiters = pendingArticleWaiters.get(tweetId);
+    if (!waiters || waiters.length === 0) {
+      return;
+    }
+    pendingArticleWaiters.delete(tweetId);
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(articleInfo);
+    }
+  }
+
+  function waitForArticleData(tweetId, timeoutMs) {
+    if (!tweetId) {
+      return Promise.resolve(null);
+    }
+    if (articleDataCache[tweetId]) {
+      return Promise.resolve(articleDataCache[tweetId]);
+    }
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const waiters = pendingArticleWaiters.get(tweetId) || [];
+        const filtered = waiters.filter((w) => w.resolve !== resolve);
+        if (filtered.length > 0) {
+          pendingArticleWaiters.set(tweetId, filtered);
+        } else {
+          pendingArticleWaiters.delete(tweetId);
+        }
+        resolve(articleDataCache[tweetId] || null);
+      }, timeoutMs);
+
+      const waiters = pendingArticleWaiters.get(tweetId) || [];
+      waiters.push({ resolve, timer });
+      pendingArticleWaiters.set(tweetId, waiters);
+    });
+  }
+
+  async function requestArticleDataFromInjector(tweetId) {
+    if (!tweetId) {
+      return null;
+    }
+    if (articleDataCache[tweetId]) {
+      return articleDataCache[tweetId];
+    }
+    const waiting = waitForArticleData(tweetId, ARTICLE_FETCH_TIMEOUT_MS);
+    window.postMessage({ type: "XTM_GET_ARTICLE", tweetId }, "*");
+    return waiting;
+  }
+
+  function extractDomArticleBlocks(mainArticle) {
+    const primaryCol = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+    const selector = [
+      '[data-testid="tweetText"]',
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "p",
+      "blockquote",
+      "ul > li",
+      "ol > li",
+      "pre",
+      'img[src*="pbs.twimg.com/media/"]',
+    ].join(", ");
+
+    const blocks = [];
+    const seenImages = new Set();
+
+    for (const node of primaryCol.querySelectorAll(selector)) {
+      if (!shouldIncludeLongformNode(node, mainArticle)) {
+        continue;
+      }
+      if (node.tagName === "P" && node.closest("blockquote")) {
+        continue;
+      }
+
+      if (node.tagName === "IMG") {
+        const src = node.getAttribute("src") || "";
+        if (!src || src.includes("emoji") || src.includes("profile_images")) {
+          continue;
+        }
+        const clean = cleanImageUrl(src);
+        if (!seenImages.has(clean)) {
+          seenImages.add(clean);
+          blocks.push({ type: "image", url: clean });
+        }
+        continue;
+      }
+
+      if (node.tagName === "PRE") {
+        const codeText = (node.innerText || node.textContent || "").replace(/\r\n/g, "\n");
+        if (codeText.trim()) {
+          blocks.push({ type: "text", content: toCodeFence(codeText.replace(/\n+$/, "")) });
+        }
+        continue;
+      }
+
+      const rawText = extractRichTextMarkdown(node).trim();
+      if (!rawText) {
+        continue;
+      }
+
+      let content = rawText;
+      if (/^H[1-6]$/.test(node.tagName)) {
+        const level = Number(node.tagName.slice(1)) || 1;
+        content = `${"#".repeat(level)} ${rawText}`;
+      } else if (node.tagName === "BLOCKQUOTE") {
+        content = rawText
+          .split("\n")
+          .map((line) => `> ${line}`)
+          .join("\n");
+      } else if (node.tagName === "LI") {
+        const listTag = node.parentElement?.tagName || "";
+        const marker = listTag === "OL" ? "1. " : "- ";
+        content = marker + rawText;
+      }
+
+      const last = blocks[blocks.length - 1];
+      if (!(last && last.type === "text" && last.content === content)) {
+        blocks.push({ type: "text", content });
+      }
+    }
+
+    return blocks;
+  }
+
+  function shouldIncludeLongformNode(node, mainArticle) {
+    if (node.closest('[data-testid="quoteTweet"]')) {
+      return false;
+    }
+
+    const parentArticle = node.closest('article[data-testid="tweet"]');
+    if (!parentArticle) {
+      return true;
+    }
+    return parentArticle === mainArticle;
+  }
+
+  function extractRichTextMarkdown(rootNode) {
+    const parts = [];
+    for (const node of rootNode.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        parts.push(node.textContent || "");
+        continue;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        continue;
+      }
+
+      if (node.tagName === "BR") {
+        parts.push("\n");
+        continue;
+      }
+
+      if (node.tagName === "A") {
+        const href = node.getAttribute("href") || "";
+        const text = (node.textContent || "").trim() || href;
+        if (href.startsWith("http")) {
+          parts.push(`[${text}](${href})`);
+        } else if (href.startsWith("/")) {
+          parts.push(`[${text}](https://x.com${href})`);
+        } else {
+          parts.push(text);
+        }
+        continue;
+      }
+
+      parts.push(extractRichTextMarkdown(node));
+    }
+    return parts.join("").replace(/\u00a0/g, " ");
+  }
+
+  function extractCodeTextFromEntityData(data) {
+    if (!data) {
+      return "";
+    }
+    if (typeof data === "string") {
+      return data;
+    }
+    if (Array.isArray(data)) {
+      const textParts = data.filter((item) => typeof item === "string");
+      if (textParts.length > 0) {
+        return textParts.join("\n");
+      }
+      return "";
+    }
+
+    const keys = ["code", "text", "source", "content", "snippet", "body", "value"];
+    for (const key of keys) {
+      const value = data[key];
+      if (!value) {
+        continue;
+      }
+      const extracted = extractCodeTextFromEntityData(value);
+      if (extracted) {
+        return extracted;
+      }
+    }
+    return "";
+  }
+
+  function toCodeFence(codeText) {
+    const normalized = (codeText || "").replace(/\r\n/g, "\n");
+    const ticks = normalized.match(/`+/g) || [];
+    const longestTick = ticks.reduce((max, t) => Math.max(max, t.length), 0);
+    const fence = "`".repeat(Math.max(3, longestTick + 1));
+    return `${fence}\n${normalized}\n${fence}`;
   }
 
   function extractText(article) {
